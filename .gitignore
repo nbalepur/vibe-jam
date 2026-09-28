@@ -39,6 +39,7 @@ yarn-error.log*
 
 # local env files
 .env*.local
+.env.prod
 
 data_tutorial
 
@@ -57,3 +58,4 @@ validate_tests.py
 .env
 
 data/function_tasks.json
+scripts/payment_roster.txt

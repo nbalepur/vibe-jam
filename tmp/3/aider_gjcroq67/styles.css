@@ -1,0 +1,35 @@
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}
+
+.container {
+  padding: 20px;
+}
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(3, 60px);
+  grid-template-rows: repeat(3, 60px);
+  gap: 8px;
+  margin: 24px 0 8px 0;
+}
+
+.board-cell {
+  width: 60px;
+  height: 60px;
+  font-size: 2rem;
+  text-align: center;
+  vertical-align: middle;
+  background: #f8f8f8;
+  border: 2px solid #888;
+  border-radius: 8px;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.2s;
+}
+
+.board-cell:disabled {
+  background: #e0e0e0;
+  color: #aaa;
+  cursor: not-allowed;
+}

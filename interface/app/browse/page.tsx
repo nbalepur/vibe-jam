@@ -24,6 +24,7 @@ import {
 } from "../config/tasks";
 import { ENV } from "../config/env";
 import { isInternalReviewerUser } from "../config/internalReviewers";
+import { isMultiSubmissionUser } from "../config/multiSubmissionAccounts";
 import { useSubmissionGalleryCounts } from "../hooks/useSubmissionGalleryCounts";
 import { useSnackbar } from "../components/SnackbarProvider";
 import { PASSWORD_HASH, hashString } from "../utils/password";
@@ -38,6 +39,10 @@ function BrowseInner() {
   const numericUserId = user?.id && !Number.isNaN(Number(user.id)) ? Number(user.id) : null;
   const isInternalReviewer = useMemo(
     () => isInternalReviewerUser(user ?? undefined),
+    [user]
+  );
+  const allowsMultipleSubmissions = useMemo(
+    () => isMultiSubmissionUser(user ?? undefined),
     [user]
   );
   const studyEnded = false;
@@ -144,13 +149,14 @@ function BrowseInner() {
     minutes: number | null;
   } | null>(null);
   const filterModalRef = useRef<HTMLDivElement | null>(null);
-  const websiteRequirementsSkipped = isWebsiteRequirementsPhaseSkippedForStudy(user?.settings);
+  const websiteRequirementsSkipped =
+    isWebsiteRequirementsPhaseSkippedForStudy(user?.settings) || allowsMultipleSubmissions;
   const studyTaskMode = useMemo(() => {
     const otherTasks = allTasks.filter((task: any) => task.id !== 'playground');
     return getStudyTaskMode(otherTasks, websiteRequirementsSkipped);
   }, [allTasks, websiteRequirementsSkipped]);
   const requiredGameTaskNames = useMemo(() => {
-    if (studyEnded) {
+    if (studyEnded || allowsMultipleSubmissions) {
       return new Set<string>();
     }
 
@@ -161,9 +167,9 @@ function BrowseInner() {
     }
 
     return new Set(getRequiredTasksForMode(mode, otherTasks));
-  }, [allTasks, studyEnded, websiteRequirementsSkipped]);
+  }, [allTasks, studyEnded, websiteRequirementsSkipped, allowsMultipleSubmissions]);
   const timedRequiredTaskNames = useMemo(() => {
-    if (studyEnded) {
+    if (studyEnded || allowsMultipleSubmissions) {
       return new Set<string>();
     }
 
@@ -174,16 +180,16 @@ function BrowseInner() {
     return new Set(
       TIMED_TASKS.filter((taskName) => requiredTaskNames.has(taskName))
     );
-  }, [allTasks, studyEnded, websiteRequirementsSkipped]);
+  }, [allTasks, studyEnded, websiteRequirementsSkipped, allowsMultipleSubmissions]);
   const requiredTaskNamesForCurrentMode = useMemo(() => {
-    if (studyEnded) {
+    if (studyEnded || allowsMultipleSubmissions) {
       return new Set<string>();
     }
 
     const otherTasks = allTasks.filter((task: any) => task.id !== 'playground');
     const mode = getStudyTaskMode(otherTasks, websiteRequirementsSkipped);
     return new Set(getRequiredTasksForMode(mode, otherTasks));
-  }, [allTasks, studyEnded, websiteRequirementsSkipped]);
+  }, [allTasks, studyEnded, websiteRequirementsSkipped, allowsMultipleSubmissions]);
   const timedTaskLimitMinutesByName = useMemo<Record<string, number>>(
     () => ({
       zic_zac_zoe: Math.max(1, ENV.RECREATION_TASK_ONE_MINUTES),
@@ -206,7 +212,7 @@ function BrowseInner() {
 
   const buildTaskListForCurrentMode = useCallback((tasks: any[]) => {
     const mode = getStudyTaskMode(tasks, websiteRequirementsSkipped);
-    if (mode === 'website-requirements') {
+    if (mode === 'website-requirements' || allowsMultipleSubmissions) {
       return tasks;
     }
 
@@ -228,7 +234,7 @@ function BrowseInner() {
     };
 
     return [playgroundTask, ...tasks];
-  }, [user?.settings, websiteRequirementsSkipped]);
+  }, [user?.settings, websiteRequirementsSkipped, allowsMultipleSubmissions]);
   
   // Load tasks
   const loadTasks = useCallback(async (signal?: AbortSignal, forceRefresh: boolean = false) => {
@@ -425,7 +431,7 @@ function BrowseInner() {
     const mode = getStudyTaskMode(otherTasks, websiteRequirementsSkipped);
     const requiredTaskNames = getRequiredTasksForMode(mode, otherTasks);
     const allRequiredCompleted = requiredTaskNames.every((taskName) => completedTaskNames.has(taskName));
-    const effectiveRequiredCompleted = studyEnded ? true : allRequiredCompleted;
+    const effectiveRequiredCompleted = studyEnded || allowsMultipleSubmissions ? true : allRequiredCompleted;
     const isWebsiteRequirementsMode = mode === 'website-requirements';
     setAllRequiredTasksCompleted(effectiveRequiredCompleted);
     
@@ -455,6 +461,15 @@ function BrowseInner() {
     } else {
       // Create user-specific seed (use username if available, otherwise user ID, fallback to 'default')
       tasksAfterRequiredFilter = filterTasksByRequiredStatus(tasksWithUpdatedPlayground);
+    }
+
+    if (allowsMultipleSubmissions) {
+      tasksAfterRequiredFilter = tasksAfterRequiredFilter.filter((task: any) => {
+        if (task.id === 'playground') return false;
+        if (task.category === 'tutorial' || task.tags?.includes('tutorial')) return false;
+        if (isWebsiteRequirementTask(task)) return false;
+        return true;
+      });
     }
 
     if (isWebsiteRequirementsMode) {
@@ -506,6 +521,7 @@ function BrowseInner() {
     const shouldEnableLocking =
       !hasSecretPassword &&
       !isInternalReviewer &&
+      !allowsMultipleSubmissions &&
       (isWebsiteRequirementsMode || !effectiveRequiredCompleted);
     if (shouldEnableLocking) {
       const lockedIds = new Set<string>();
@@ -533,13 +549,13 @@ function BrowseInner() {
           !isWebsiteRequirementsMode &&
           isCompleted &&
           GAME_REQUIRED_TASKS.includes(task.name as any);
-        if (isCompletedRequiredGameTask) {
+        if (isCompletedRequiredGameTask && !allowsMultipleSubmissions) {
           lockedIds.add(task.id);
           noEditIds.add(task.id);
           continue;
         }
         
-        if (isWebsiteRequirementsMode && isCompleted) {
+        if (isWebsiteRequirementsMode && isCompleted && !allowsMultipleSubmissions) {
           // For website requirements tasks, completed tasks stay locked.
           lockedIds.add(task.id);
         } else if (!isCompleted && activeId === null) {
@@ -557,6 +573,7 @@ function BrowseInner() {
     } else if (
       !hasSecretPassword &&
       !isInternalReviewer &&
+      !allowsMultipleSubmissions &&
       !isWebsiteRequirementsMode &&
       completedRequiredGameTaskIds.size > 0
     ) {
@@ -582,6 +599,7 @@ function BrowseInner() {
     categoryFilters,
     hasSecretPassword,
     isInternalReviewer,
+    allowsMultipleSubmissions,
     user,
     numericUserId,
     studyEnded,
@@ -633,7 +651,7 @@ function BrowseInner() {
       allTasks.find((task: any) => task.id === taskId);
     const selectedTaskName = selectedTask?.name;
 
-    if (selectedTaskName && timedTaskNamesSet.has(selectedTaskName) && !isInternalReviewer) {
+    if (selectedTaskName && timedTaskNamesSet.has(selectedTaskName) && !isInternalReviewer && !allowsMultipleSubmissions) {
       setTimedTaskModalState({
         taskId,
         taskTitle: selectedTask?.title || selectedTaskName,
@@ -775,7 +793,7 @@ function BrowseInner() {
             </div>
 
             {/* Search Bar */}
-            {(allRequiredTasksCompleted || hasSecretPassword) && (
+            {(allRequiredTasksCompleted || hasSecretPassword || allowsMultipleSubmissions) && (
               <div className="flex items-center justify-between w-full mb-6">
                 {/* Left side - Search questions, Filter button - 50% width */}
                 <div className="flex items-center space-x-3 w-1/2">
@@ -915,6 +933,7 @@ function BrowseInner() {
                     isLockingEnabled={
                       !hasSecretPassword &&
                       !isInternalReviewer &&
+                      !allowsMultipleSubmissions &&
                       (studyTaskMode === 'website-requirements' ||
                         !allRequiredTasksCompleted ||
                         noEditLockedTaskIds.size > 0)

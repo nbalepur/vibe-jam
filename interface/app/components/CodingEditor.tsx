@@ -18,6 +18,7 @@ import LoadingSpinner from './LoadingSpinner';
 import Link from 'next/link';
 import { useUserStudyPopup } from './UserStudyPopup';
 import { WEBSITE_REQUIREMENT_TASKS } from '../config/tasks';
+import { isMultiSubmissionUser } from '../config/multiSubmissionAccounts';
 import { ERROR_TRY_AGAIN } from '../utils/constants';
 import { useAuth } from '../utils/auth';
 import { setPlaygroundCompletedInSettings } from '../utils/userSettings';
@@ -46,6 +47,11 @@ const SELF_REPORT_OPTIONS = [
   "4 - Agree",
   "5 - Strongly agree",
 ];
+
+const SUBMITTER_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const STORED_SUBMISSION_TITLE_LIMIT = 255;
+
+const isValidSubmitterEmail = (value: string): boolean => SUBMITTER_EMAIL_PATTERN.test(value.trim());
 
 const isSelfReportQuestionName = (questionName?: string): boolean => {
   if (!questionName) {
@@ -1223,6 +1229,8 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
   const [projectDescription, setProjectDescription] = useState('');
   const [projectTitleError, setProjectTitleError] = useState<string | null>(null);
   const [projectDescriptionError, setProjectDescriptionError] = useState<string | null>(null);
+  const [submitterEmail, setSubmitterEmail] = useState('');
+  const [submitterEmailError, setSubmitterEmailError] = useState<string | null>(null);
   const [implementedRequirements, setImplementedRequirements] = useState<Record<string, boolean>>({});
   const [requirementsComments, setRequirementsComments] = useState('');
   const [requirementsCommentsError, setRequirementsCommentsError] = useState<string | null>(null);
@@ -1270,6 +1278,7 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
   const isRequiredTask = Boolean(
     !studyEnded && normalizedTaskName && WEBSITE_REQUIREMENT_TASKS.includes(normalizedTaskName as any)
   );
+  const allowsMultipleSubmissions = isMultiSubmissionUser(user ?? undefined);
   const isSubmissionQuestionsPersistentTask = Boolean(
     normalizedTaskName && WEBSITE_REQUIREMENT_TASKS.includes(normalizedTaskName as any)
   );
@@ -1383,6 +1392,7 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
 
   const trimmedProjectTitleLength = projectTitle.trim().length;
   const trimmedProjectDescriptionLength = projectDescription.trim().length;
+  const trimmedSubmitterEmail = submitterEmail.trim();
   const trimmedRequirementsCommentsLength = requirementsComments.trim().length;
   const implementedRequirementCount = Object.values(implementedRequirements).filter(Boolean).length;
   const isSubmitDisabled = !!(
@@ -1395,7 +1405,8 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
         ? false
         : (!trimmedProjectTitleLength || !trimmedProjectDescriptionLength || !previewScreenshot)
     ) ||
-    (existingSubmission && !hasConsentedToOverride)
+    (allowsMultipleSubmissions && !isTutorialTask && !isValidSubmitterEmail(trimmedSubmitterEmail)) ||
+    (existingSubmission && !hasConsentedToOverride && !allowsMultipleSubmissions)
   );
   const isFirstPaneActionDisabled = !!(
     isSubmitDisabled ||
@@ -1416,6 +1427,7 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
     : null;
   const titleInputId = 'submit-project-title';
   const descriptionInputId = 'submit-project-description';
+  const submitterEmailInputId = 'submit-project-email';
   const isProjectTitleAtCap = trimmedProjectTitleLength >= PROJECT_TITLE_LIMIT;
   const isProjectDescriptionAtCap = trimmedProjectDescriptionLength >= PROJECT_DESCRIPTION_LIMIT;
   const previewBoxContainerRef = useRef<HTMLDivElement>(null);
@@ -2696,6 +2708,8 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
       setProjectDescription('');
       setProjectTitleError(null);
       setProjectDescriptionError(null);
+      setSubmitterEmail('');
+      setSubmitterEmailError(null);
       setImplementedRequirements({});
       setRequirementsComments('');
       setRequirementsCommentsError(null);
@@ -2720,6 +2734,12 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
     // Check for existing submission
     const checkExistingSubmission = async () => {
       if (!userId || !projectId) return;
+      if (allowsMultipleSubmissions) {
+        setExistingSubmission(null);
+        setHasConsentedToOverride(false);
+        setIsCheckingExistingSubmission(false);
+        return;
+      }
       
       setIsCheckingExistingSubmission(true);
       try {
@@ -2787,7 +2807,7 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
     return () => {
       cancelled = true;
     };
-  }, [showSubmitModal, createPreviewScreenshot, userId, projectId, task_id, isRequiredTask]);
+  }, [showSubmitModal, createPreviewScreenshot, userId, projectId, task_id, isRequiredTask, allowsMultipleSubmissions]);
 
   useEffect(() => {
     if (!showSubmitModal || !isRequiredTask || !taskRequirements || taskRequirements.length === 0) {
@@ -3339,9 +3359,21 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
     }
 
     // Check if there's an existing submission that requires consent
-    if (existingSubmission && !hasConsentedToOverride) {
+    if (existingSubmission && !hasConsentedToOverride && !allowsMultipleSubmissions) {
       setSubmissionError('Please confirm that you want to override your existing submission.');
       hasError = true;
+    }
+
+    if (allowsMultipleSubmissions && !isTutorialTask) {
+      if (!trimmedSubmitterEmail) {
+        setSubmitterEmailError('Please add your email so we can identify this submission.');
+        hasError = true;
+      } else if (!isValidSubmitterEmail(trimmedSubmitterEmail)) {
+        setSubmitterEmailError('Please enter a valid email address.');
+        hasError = true;
+      } else {
+        setSubmitterEmailError(null);
+      }
     }
 
     if (hasError) {
@@ -3658,6 +3690,11 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
 
     setIsSubmittingProject(true);
     setSubmissionError(null);
+    if (allowsMultipleSubmissions) {
+      try {
+        window.dispatchEvent(new Event('kiosk-suppress-code-logs'));
+      } catch {}
+    }
     
     try {
       const response = await fetch(`${ENV.BACKEND_URL}/api/submissions`, {
@@ -3669,7 +3706,9 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
           userId,
           projectId,
           taskId: task_id || null,
-          title: projectTitle.trim(),
+          title: allowsMultipleSubmissions && submitterEmail.trim()
+            ? `${(projectTitle.trim() || 'Untitled')} (${submitterEmail.trim()})`.slice(0, STORED_SUBMISSION_TITLE_LIMIT)
+            : projectTitle.trim(),
           description: projectDescription.trim(),
           code: codeSnapshot,
           image: previewScreenshot,
@@ -3704,6 +3743,12 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
       // Reset consent state after successful submission
       setHasConsentedToOverride(false);
       setExistingSubmission(null);
+      if (allowsMultipleSubmissions) {
+        setProjectTitle('');
+        setProjectDescription('');
+        setSubmitterEmail('');
+        setSubmitterEmailError(null);
+      }
       // Reset comprehension answers
       setComprehensionAnswers({});
       // Reset evaluation result and ID
@@ -3712,13 +3757,17 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
       
       // Show success snackbar immediately after submission
       showSnackbar(
-        <>
-          Nice work! Navigate back to the{' '}
-          <Link href="/browse" style={{ color: '#3b82f6', textDecoration: 'underline' }}>
-            tasks page
-          </Link>{' '}
-          to work on other projects
-        </>,
+        allowsMultipleSubmissions ? (
+          <>Thanks! Your submission was saved. The editor has been cleared for the next person.</>
+        ) : (
+          <>
+            Nice work! Navigate back to the{' '}
+            <Link href="/browse" style={{ color: '#3b82f6', textDecoration: 'underline' }}>
+              tasks page
+            </Link>{' '}
+            to work on other projects
+          </>
+        ),
         12000 // 12 seconds
       );
       
@@ -4814,6 +4863,56 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
               </div>
               )}
 
+              {allowsMultipleSubmissions && !isTutorialTask && (
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '6px' }}>
+                <label
+                  htmlFor={submitterEmailInputId}
+                  style={{
+                    display: 'flex',
+                    justifyContent: 'space-between',
+                    alignItems: 'center',
+                    color: '#e5e7eb',
+                    fontWeight: 500,
+                    fontSize: '14px',
+                    marginBottom: '0'
+                  }}
+                >
+                  <span>Your email</span>
+                  <span style={{ color: '#9ca3af', fontSize: '12px' }}>Required</span>
+                </label>
+                <input
+                  id={submitterEmailInputId}
+                  type="email"
+                  autoComplete="email"
+                  value={submitterEmail}
+                  onChange={(e) => {
+                    const nextEmail = e.target.value;
+                    setSubmitterEmail(nextEmail);
+                    if (submitterEmailError) {
+                      if (isValidSubmitterEmail(nextEmail)) {
+                        setSubmitterEmailError(null);
+                      }
+                    }
+                  }}
+                  placeholder="We'll attach this to your submission title so we can tell entries apart"
+                  style={{
+                    width: '100%',
+                    padding: '12px',
+                    borderRadius: '6px',
+                    border: submitterEmailError ? '1px solid #f87171' : '1px solid #4b5563',
+                    backgroundColor: '#1f2937',
+                    color: '#e5e7eb',
+                    fontSize: '14px'
+                  }}
+                />
+                {submitterEmailError && (
+                  <div style={{ color: '#f87171', fontSize: '12px', marginTop: '4px' }}>
+                    {submitterEmailError}
+                  </div>
+                )}
+              </div>
+              )}
+
               {!isRequiredTask && (
               <div style={{ display: 'grid', gridTemplateColumns: '1fr', gap: '6px' }}>
                 <label
@@ -5207,7 +5306,7 @@ const CodingEditor: React.FC<CodingEditorProps> = ({
                 </div>
               )}
 
-              {existingSubmission && (
+              {existingSubmission && !allowsMultipleSubmissions && (
                 <div
                   style={{
                     padding: '12px 14px',

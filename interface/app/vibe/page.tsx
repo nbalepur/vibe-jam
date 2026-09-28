@@ -65,6 +65,7 @@ import { PASSWORD_HASH, hashString } from "../utils/password";
 import { ERROR_TRY_AGAIN } from "../utils/constants";
 import { downloadProjectAsRepository } from "../utils/downloadProject";
 import { isInternalReviewerUser } from "../config/internalReviewers";
+import { isMultiSubmissionUser } from "../config/multiSubmissionAccounts";
 import { useSubmissionGalleryCounts } from "../hooks/useSubmissionGalleryCounts";
 
 type CodeLogEvent = "save-shortcut" | "before-unload" | "preview-refresh" | "AI-refresh" | "keep" | "reject" | "keep_all" | "reject_all" | "download" | "undo" | "redo" | "copy_from_assistant";
@@ -106,6 +107,10 @@ function HomeInner() {
   const numericUserId = user?.id && !Number.isNaN(Number(user.id)) ? Number(user.id) : null;
   const isInternalReviewer = useMemo(
     () => isInternalReviewerUser(user ?? undefined),
+    [user]
+  );
+  const allowsMultipleSubmissions = useMemo(
+    () => isMultiSubmissionUser(user ?? undefined),
     [user]
   );
   const studyEnded = false;
@@ -296,6 +301,7 @@ function HomeInner() {
   const timerExpiredModalShownRef = useRef(false);
   const isSubmissionQuestionsPaneOpenRef = useRef(false);
   const timedTaskFilesPendingRef = useRef<any[] | null>(null);
+  const suppressCodeLogsRef = useRef(false);
   
   // Resize state
   const [leftColumnWidth, setLeftColumnWidth] = useState(0);
@@ -320,11 +326,12 @@ function HomeInner() {
   const previewTabRef = useRef<PreviewTabRef>(null);
   const [allTasks, setAllTasks] = useState<any[]>([]);
   const [isLoadingTasks, setIsLoadingTasks] = useState(true);
-  const websiteRequirementsSkipped = isWebsiteRequirementsPhaseSkippedForStudy(user?.settings);
+  const websiteRequirementsSkipped =
+    isWebsiteRequirementsPhaseSkippedForStudy(user?.settings) || allowsMultipleSubmissions;
 
   const buildTaskListForCurrentMode = useCallback((tasks: any[]) => {
     const mode = getStudyTaskMode(tasks, websiteRequirementsSkipped);
-    if (mode === 'website-requirements') {
+    if (mode === 'website-requirements' || allowsMultipleSubmissions) {
       return tasks;
     }
 
@@ -346,7 +353,7 @@ function HomeInner() {
     };
 
     return [playgroundTask, ...tasks];
-  }, [user?.settings, websiteRequirementsSkipped]);
+  }, [user?.settings, websiteRequirementsSkipped, allowsMultipleSubmissions]);
   
   // Chat state
   const [chatHistory, setChatHistory] = useState<any[]>([
@@ -919,6 +926,7 @@ function HomeInner() {
   }, [user, selectedTask, currentTaskMeta, getCodeByLanguage, leftTab, showCodingTerminal, debugTerminalOpen, allTasks, pendingAgentChanges]);
 
   const sendCodeLog = useCallback(async (event: CodeLogEvent, context: Record<string, any> = {}) => {
+    if (suppressCodeLogsRef.current) return;
     const payload = buildCodeLogPayload(event, context);
     if (!payload) return;
     
@@ -936,6 +944,7 @@ function HomeInner() {
   }, [buildCodeLogPayload]);
 
   const sendCodeLogBeacon = useCallback((event: CodeLogEvent, context: Record<string, any> = {}) => {
+    if (suppressCodeLogsRef.current) return;
     const payload = buildCodeLogPayload(event, context);
     if (!payload) return;
     
@@ -1285,17 +1294,20 @@ function HomeInner() {
   }, [allTasks, selectedTask, currentTaskMeta?.name, isPlaygroundMode]);
 
   const isTimedTaskSelected = useMemo(() => {
+    // Shared kiosk accounts should not inherit a single persisted timer across people.
+    if (allowsMultipleSubmissions) return false;
     if (!selectedTaskName) return false;
     return TIMED_TASKS.includes(selectedTaskName as any);
-  }, [selectedTaskName]);
+  }, [selectedTaskName, allowsMultipleSubmissions]);
 
   const shouldWarnOnPageLeaveForTask = useMemo(() => {
+    if (allowsMultipleSubmissions) return false;
     if (!selectedTaskName) return false;
     return (
       isWebsiteRequirementsTaskSelected ||
       GAME_REQUIRED_TASKS.includes(selectedTaskName as any)
     );
-  }, [isWebsiteRequirementsTaskSelected, selectedTaskName]);
+  }, [isWebsiteRequirementsTaskSelected, selectedTaskName, allowsMultipleSubmissions]);
 
   const taskTimerDurationSeconds = useMemo(() => {
     switch (selectedTaskName) {
@@ -1978,6 +1990,9 @@ function HomeInner() {
 
   // Callback to refresh tasks cache after project submission
   const handleProjectSubmitted = useCallback(async () => {
+    if (allowsMultipleSubmissions) {
+      suppressCodeLogsRef.current = true;
+    }
     // Log successful submissions across all non-playground tasks.
     void sendTaskEvent("submitted", { source: "project_submitted" });
     // Refresh tasks cache to update statuses after submission
@@ -1988,7 +2003,30 @@ function HomeInner() {
     }
 
     // Required game tasks only allow one submission; return participants to browse.
-    if (currentTaskMeta?.name && GAME_REQUIRED_TASKS.includes(currentTaskMeta.name as any)) {
+    // Multi-submission kiosk accounts go back to browse with a cleared workspace
+    // so the next person starts from a blank starter project.
+    if (allowsMultipleSubmissions) {
+      try {
+        localStorage.removeItem('multiFileEditor_files');
+        localStorage.setItem('code', '');
+      } catch {}
+      setHistory([]);
+      setHistoryIndex(0);
+      setInitialFiles([]);
+      setCurrentFiles([]);
+      setCode('');
+      setExpandedTask(null);
+      setShowCodingTerminal(false);
+      setSelectedTask(null);
+      setTaskId('');
+      setCurrentTaskMeta(null);
+      router.push('/browse');
+      return;
+    }
+    if (
+      currentTaskMeta?.name &&
+      GAME_REQUIRED_TASKS.includes(currentTaskMeta.name as any)
+    ) {
       setExpandedTask(null);
       setShowCodingTerminal(false);
       setSelectedTask(null);
@@ -1996,7 +2034,7 @@ function HomeInner() {
       setCurrentTaskMeta(null);
       router.push('/browse');
     }
-  }, [loadTasks, recalculateState, sendTaskEvent, currentTaskMeta?.name, router]);
+  }, [loadTasks, recalculateState, sendTaskEvent, currentTaskMeta?.name, router, allowsMultipleSubmissions]);
 
   const handleQuestionsGenerationStarted = useCallback((metadata?: Record<string, any>) => {
     void sendTaskEvent("questions_generation_started", {
@@ -2050,7 +2088,15 @@ function HomeInner() {
     timedTaskFilesPendingRef.current = null;
   }, []);
 
-  // Refresh tasks when returning to tasks view (when showCodingTerminal becomes false)
+  useEffect(() => {
+    const suppressCodeLogs = () => {
+      suppressCodeLogsRef.current = true;
+    };
+    window.addEventListener('kiosk-suppress-code-logs', suppressCodeLogs);
+    return () => {
+      window.removeEventListener('kiosk-suppress-code-logs', suppressCodeLogs);
+    };
+  }, []);
   // Note: We no longer refresh automatically since tasks are cached and status updates aren't critical
   // If you need to refresh, you can add `loadTasks(undefined, true)` with forceRefresh=true
   // useEffect(() => {
@@ -3279,6 +3325,15 @@ function HomeInner() {
     } else {
       tasksAfterRequiredFilter = filterTasksByRequiredStatus(tasksWithUpdatedPlayground);
     }
+
+    if (allowsMultipleSubmissions) {
+      tasksAfterRequiredFilter = tasksAfterRequiredFilter.filter((task: any) => {
+        if (task.id === 'playground') return false;
+        if (task.category === 'tutorial' || task.tags?.includes('tutorial')) return false;
+        if (isWebsiteRequirementTask(task)) return false;
+        return true;
+      });
+    }
     
     // Then filter by status
     // Always include playground task regardless of status filters
@@ -3322,6 +3377,7 @@ function HomeInner() {
     pathname,
     hasSecretPassword,
     isInternalReviewer,
+    allowsMultipleSubmissions,
     user,
   ]);
 
@@ -3647,6 +3703,7 @@ function HomeInner() {
   };
 
   const startTask = async (taskId: string, updateUrl: boolean) => {
+    suppressCodeLogsRef.current = false;
     // Abort any previous task loading requests
     if (taskAbortControllerRef.current) {
       taskAbortControllerRef.current.abort();
@@ -3718,7 +3775,10 @@ function HomeInner() {
         votingEndDate,
       } = await getInitialFilesForTask(taskId, abortController.signal);
       const task = allTasks.find((t: any) => t.id === taskId);
-      const isTimedTask = task && TIMED_TASKS.includes(normalizeTaskNameKey(task.name) as any);
+      const isTimedTask =
+        !allowsMultipleSubmissions &&
+        task &&
+        TIMED_TASKS.includes(normalizeTaskNameKey(task.name) as any);
       if (isTimedTask) {
         timedTaskFilesPendingRef.current = files;
         setInitialFiles([]);
@@ -3880,6 +3940,15 @@ function HomeInner() {
           visibleTasks = filterTasksByRequiredStatus(tasksWithUpdatedPlayground);
         }
 
+        if (allowsMultipleSubmissions) {
+          visibleTasks = visibleTasks.filter((task: any) => {
+            if (task.id === 'playground') return false;
+            if (task.category === 'tutorial' || task.tags?.includes('tutorial')) return false;
+            if (isWebsiteRequirementTask(task)) return false;
+            return true;
+          });
+        }
+
         const visibleTaskIds = new Set(visibleTasks.map((task: any) => task.id));
         if (!visibleTaskIds.has(canonicalTaskId)) {
           redirectToBrowse();
@@ -3887,7 +3956,7 @@ function HomeInner() {
         }
 
         const lockedTaskIds = new Set<string>();
-        if (!hasSecretPassword && !isInternalReviewer) {
+        if (!hasSecretPassword && !isInternalReviewer && !allowsMultipleSubmissions) {
           const otherTasks = tasksWithUpdatedPlayground.filter((task: any) => task.id !== 'playground');
           const completedTaskNames = new Set(
             otherTasks
@@ -3916,7 +3985,7 @@ function HomeInner() {
               }
 
               const isCompleted = task.status === 'completed';
-              if (isWebsiteRequirementsMode && isCompleted) {
+              if (isWebsiteRequirementsMode && isCompleted && !allowsMultipleSubmissions) {
                 lockedTaskIds.add(task.id);
               } else if (!isCompleted && activeId === null) {
                 activeId = task.id;
@@ -3959,6 +4028,7 @@ function HomeInner() {
     isPlaygroundMode,
     hasSecretPassword,
     isInternalReviewer,
+    allowsMultipleSubmissions,
     filterTasksByRequiredStatus,
     user?.settings,
     studyEnded,

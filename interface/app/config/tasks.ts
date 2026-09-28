@@ -103,3 +103,14 @@ export const INTERNAL_REVIEWER_IDENTIFIERS: string[] = [
   'gpt-many-shot',
 ];
 
+/**
+ * Shared kiosk / conference accounts that may submit more than once per task.
+ * Matched case-insensitively against username, email, and `String(user.id)`.
+ * Each submission is kept (not collapsed to latest-per-user) and tagged with
+ * the email collected on the submit form. These accounts skip the tutorial,
+ * website-requirements phase, and required-task sequence.
+ */
+export const MULTI_SUBMISSION_ACCOUNT_IDENTIFIERS: string[] = [
+  'hcomp_2026_user',
+];
+

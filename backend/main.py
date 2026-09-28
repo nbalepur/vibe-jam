@@ -315,6 +315,73 @@ def _slugify(name: str) -> str:
     return slug
 
 
+# Shared kiosk / conference accounts that may submit more than once per task.
+# Keep in sync with MULTI_SUBMISSION_ACCOUNT_IDENTIFIERS in interface/app/config/tasks.ts
+MULTI_SUBMISSION_ACCOUNT_IDENTIFIERS = frozenset({"hcomp_2026_user"})
+
+
+def _multi_submission_user_ids(db: Session) -> set:
+    identifiers = [s.strip().lower() for s in MULTI_SUBMISSION_ACCOUNT_IDENTIFIERS if s and s.strip()]
+    if not identifiers:
+        return set()
+    rows = (
+        db.query(User.id)
+        .filter(
+            or_(
+                func.lower(User.username).in_(identifiers),
+                func.lower(User.email).in_(identifiers),
+            )
+        )
+        .all()
+    )
+    return {int(row[0]) for row in rows if row and row[0] is not None}
+
+
+def _is_multi_submission_user(user: Optional[User]) -> bool:
+    if not user:
+        return False
+    identifiers = {s.strip().lower() for s in MULTI_SUBMISSION_ACCOUNT_IDENTIFIERS if s and s.strip()}
+    if not identifiers:
+        return False
+    username = (user.username or "").strip().lower()
+    email = (user.email or "").strip().lower()
+    return username in identifiers or email in identifiers
+
+
+def _is_kiosk_reset_code(code_record: Optional[Code]) -> bool:
+    if not code_record:
+        return False
+    if getattr(code_record, "mode", None) == "kiosk_reset":
+        return True
+    meta = getattr(code_record, "code_metadata", None) or {}
+    if isinstance(meta, dict) and meta.get("event") == "kiosk_reset":
+        return True
+    payload = code_record.code if isinstance(code_record.code, dict) else {}
+    return bool(payload.get("__kiosk_reset"))
+
+
+def _reset_kiosk_in_progress_workspace(db: Session, user_id: int, current_project_id: Optional[int] = None) -> None:
+    """Mark in-progress editor state as reset so the next kiosk visitor loads starter files."""
+    project_ids = {
+        int(row[0])
+        for row in db.query(Code.project_id).filter(Code.user_id == user_id).distinct().all()
+        if row and row[0] is not None
+    }
+    if current_project_id is not None:
+        project_ids.add(int(current_project_id))
+    for project_id in project_ids:
+        CodeCRUD.create(
+            db,
+            CodeCreate(
+                user_id=user_id,
+                project_id=project_id,
+                code={"__kiosk_reset": "1"},
+                mode="kiosk_reset",
+                metadata={"event": "kiosk_reset"},
+            ),
+        )
+
+
 INJECTED_TASK_DESCRIPTIONS: Dict[str, str] = {
     "zic_zac_zoe": (
         "<p>In this task, you'll create a variation of tic-tac-toe on a 5x5 grid with two human players: "
@@ -3147,8 +3214,8 @@ async def get_task_files_from_db(taskId: str, userId: Optional[int] = None, db: 
             # Verify we're loading code for the correct project
             user_code = CodeCRUD.get_latest_by_user_and_project(db, user_id=userId, project_id=project.id)
 
-        # Prefer latest saved editor code for this task.
-        if user_code and user_code.code:
+        # Prefer latest saved editor code for this task, unless a kiosk account just reset.
+        if user_code and user_code.code and not _is_kiosk_reset_code(user_code):
             initial_code_payload = user_code.code
         # Special-case follow-up task: seed from latest zic-zac-zoe submission.
         elif userId and project and normalized_task_id == "zic-zac-zoe-follow-up":
@@ -3744,6 +3811,12 @@ async def create_submission(payload: SubmissionRequest, db: Session = Depends(ge
                     print(f"  Updated question {question_name}: user_answer={question.user_answer}, score={question.score}")
             
             db.commit()
+
+        if _is_multi_submission_user(user):
+            try:
+                _reset_kiosk_in_progress_workspace(db, user.id, project.id)
+            except Exception as reset_error:
+                print(f"Error resetting kiosk workspace after submission: {reset_error}")
         
         return {
             "success": True,
@@ -3870,10 +3943,16 @@ async def list_submissions(
             .all()
         )
         
-        # Group by user_id and keep only the most recent submission for each user
+        # Group by user_id and keep only the most recent submission for each user,
+        # except multi-submission kiosk accounts, which keep every submission.
+        multi_submit_user_ids = _multi_submission_user_ids(db)
         most_recent_by_user: Dict[int, Submission] = {}
+        multi_submit_submissions: List[Submission] = []
         for submission in all_submissions:
             user_id = submission.user_id
+            if user_id in multi_submit_user_ids:
+                multi_submit_submissions.append(submission)
+                continue
             if user_id not in most_recent_by_user:
                 most_recent_by_user[user_id] = submission
             else:
@@ -3884,7 +3963,7 @@ async def list_submissions(
                         most_recent_by_user[user_id] = submission
         
         # Convert to list and apply pagination
-        submissions = list(most_recent_by_user.values())
+        submissions = list(most_recent_by_user.values()) + multi_submit_submissions
         # Sort by created_at descending (most recent first)
         # Use a very old date as fallback for None values
         min_date = datetime(1970, 1, 1)
@@ -3946,13 +4025,26 @@ async def submission_gallery_count(
         project = _resolve_project_from_task_id(db, task_id)
         if not project:
             return {"count": 0}
+        multi_submit_user_ids = _multi_submission_user_ids(db)
         n = (
             db.query(func.count(distinct(Submission.user_id)))
             .filter(Submission.project_id == project.id)
             .filter(Submission.is_disqualified == False)
-            .scalar()
         )
-        return {"count": int(n or 0)}
+        if multi_submit_user_ids:
+            n = n.filter(~Submission.user_id.in_(multi_submit_user_ids))
+        distinct_user_count = int(n.scalar() or 0)
+        extra_count = 0
+        if multi_submit_user_ids:
+            extra_count = int(
+                db.query(func.count(Submission.id))
+                .filter(Submission.project_id == project.id)
+                .filter(Submission.is_disqualified == False)
+                .filter(Submission.user_id.in_(multi_submit_user_ids))
+                .scalar()
+                or 0
+            )
+        return {"count": distinct_user_count + extra_count}
     except Exception as e:
         print(f"Error counting gallery submissions: {e}")
         return JSONResponse(status_code=500, content={"error": "Failed to count submissions"})
@@ -3980,14 +4072,30 @@ async def submission_gallery_counts(
         if not project_ids_by_task_id:
             return {"byTaskId": {task_id: 0 for task_id in normalized_task_ids}}
 
-        rows = (
+        project_ids = list(project_ids_by_task_id.values())
+        multi_submit_user_ids = _multi_submission_user_ids(db)
+
+        distinct_query = (
             db.query(Submission.project_id, func.count(distinct(Submission.user_id)))
-            .filter(Submission.project_id.in_(list(project_ids_by_task_id.values())))
+            .filter(Submission.project_id.in_(project_ids))
             .filter(Submission.is_disqualified == False)
-            .group_by(Submission.project_id)
-            .all()
         )
+        if multi_submit_user_ids:
+            distinct_query = distinct_query.filter(~Submission.user_id.in_(multi_submit_user_ids))
+        rows = distinct_query.group_by(Submission.project_id).all()
         counts_by_project_id = {int(project_id): int(count or 0) for project_id, count in rows}
+
+        if multi_submit_user_ids:
+            extra_rows = (
+                db.query(Submission.project_id, func.count(Submission.id))
+                .filter(Submission.project_id.in_(project_ids))
+                .filter(Submission.is_disqualified == False)
+                .filter(Submission.user_id.in_(multi_submit_user_ids))
+                .group_by(Submission.project_id)
+                .all()
+            )
+            for project_id, count in extra_rows:
+                counts_by_project_id[int(project_id)] = counts_by_project_id.get(int(project_id), 0) + int(count or 0)
 
         response = {}
         for task_id in normalized_task_ids:

@@ -14,6 +14,7 @@ import {
 } from "../utils/userSettings";
 import { PASSWORD_HASH, hashString } from "../utils/password";
 import { isInternalReviewerUser } from "../config/internalReviewers";
+import { isMultiSubmissionUser } from "../config/multiSubmissionAccounts";
 
 type TutorialCookieState = 'unseen' | 'seen' | 'dismissed';
 const TUTORIAL_COOKIE_NAME = `${ENV.COOKIE_PREFIX}tutorial_state`;
@@ -76,6 +77,15 @@ export default function UserStudyPopupProvider({ children }: UserStudyPopupProvi
     
     // If secret password is present, bypass all popup logic
     if (hasSecretPassword) {
+      return 'none';
+    }
+
+    // Shared kiosk accounts should not be gated by pre/post-test after the first submit.
+    if (isMultiSubmissionUser(user ?? undefined)) {
+      setPreTestCompleted(true);
+      setPostTestCompleted(true);
+      setAllRequiredTasksCompleted(true);
+      setPostTestBlockedByParticipantCap(false);
       return 'none';
     }
     
